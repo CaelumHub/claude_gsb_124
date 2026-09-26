@@ -279,10 +279,11 @@ async function loadPermissions(viaRefresh = false) {
 
 function sourceOf(username) {
   if (!perm) return '—';
+  const key = (username || '').toLowerCase();
   const u = perm.users.find((x) => x.username === username);
   if (u?.role === 'admin') return '系统管理员(覆盖为 owner)';
-  if (perm.owner === username) return '白板所有者';
-  if ((perm.acl || {})[username]) return `成员授权 · ${ROLE_LABEL[perm.acl[username]]}`;
+  if ((perm.owner || '').toLowerCase() === key) return '白板所有者';
+  if ((perm.acl || {})[key]) return `成员授权 · ${ROLE_LABEL[perm.acl[key]]}`;
   if (perm.public_role) return `邀请链接 · ${ROLE_LABEL[perm.public_role]}`;
   return '未授权(无法访问)';
 }
@@ -297,8 +298,8 @@ function renderMatrix() {
     : '⚠ 仅白板所有者或系统管理员可修改成员权限, 当前为只读视图。';
 
   tbody.innerHTML = perm.users.map((u) => {
-    const isOwner = u.username === perm.owner;
-    const aclRole = pendingAcl[u.username] || '';
+    const isOwner = u.username.toLowerCase() === (perm.owner || '').toLowerCase();
+    const aclRole = pendingAcl[u.username.toLowerCase()] || '';
     const selectHtml = isOwner
       ? `<span class="badge accent">所有者</span>`
       : `<select class="select role-select sm" data-user="${escapeHtml(u.username)}" ${canManage ? '' : 'disabled'}>
@@ -327,7 +328,7 @@ function renderMatrix() {
   tbody.querySelectorAll('select[data-user]').forEach((sel) => {
     sel.onclick = (e) => e.stopPropagation();
     sel.onchange = (e) => {
-      const username = sel.dataset.user;
+      const username = sel.dataset.user.toLowerCase();   // acl 键与服务端一致: 小写
       if (e.target.value) pendingAcl[username] = e.target.value;
       else delete pendingAcl[username];
       updateSaveState();
@@ -422,10 +423,11 @@ async function copyInvite() {
 function effectiveRole(username) {
   // 与 backend/auth.py board_role 同逻辑(以 pending 值预演保存后的效果)
   const u = perm.users.find((x) => x.username === username);
+  const key = (username || '').toLowerCase();
   const acl = pendingAcl;
   if (u?.role === 'admin') return { role: 'owner', source: '系统管理员 → 覆盖为 owner', step: 1 };
-  if (perm.owner === username) return { role: 'owner', source: '白板所有者(meta.owner)', step: 2 };
-  if (acl[username]) return { role: acl[username], source: `成员授权表 acl → ${ROLE_LABEL[acl[username]]}`, step: 3 };
+  if ((perm.owner || '').toLowerCase() === key) return { role: 'owner', source: '白板所有者(meta.owner)', step: 2 };
+  if (acl[key]) return { role: acl[key], source: `成员授权表 acl → ${ROLE_LABEL[acl[key]]}`, step: 3 };
   if (pendingPublic) return { role: pendingPublic, source: `邀请链接默认角色 → ${ROLE_LABEL[pendingPublic]}`, step: 4 };
   return { role: null, source: '无任何授权 → 拒绝访问', step: 5 };
 }

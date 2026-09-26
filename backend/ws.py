@@ -337,7 +337,7 @@ class ConnectionManager:
 
     # ------------------------------------------------------------ 操作接入
     async def _handle_ops(self, client: Client, room: Room, msg: Dict[str, Any]) -> None:
-        if not auth.role_at_least(client.role, "commenter"):
+        if not auth.role_at_least(client.role, "editor"):
             await self.send(client, {"type": "error", "code": "read_only",
                                      "message": "当前角色无法编辑(需要 editor 及以上)"})
             return

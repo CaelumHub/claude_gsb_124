@@ -93,7 +93,7 @@ async def list_users(user: Dict[str, Any] = Depends(auth.current_user)):
 @app.patch("/api/users/{username}")
 async def patch_user(username: str, req: UserPatchReq,
                      user: Dict[str, Any] = Depends(auth.current_user)):
-    is_self = user["username"] == username
+    is_self = auth.norm_username(user["username"]) == auth.norm_username(username)
     if not is_self and user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="只能修改自己的资料")
     patch = req.model_dump(exclude_none=True)

@@ -451,7 +451,8 @@ async def delete_board(board_id: str, user: Dict[str, Any] = Depends(auth.curren
     meta = manager.get_meta(board_id)
     if meta is None:
         raise HTTPException(status_code=404, detail="白板不存在")
-    if meta.get("owner") != user["username"] and user.get("role") != "admin":
+    if auth.norm_username(meta.get("owner")) != auth.norm_username(user.get("username")) \
+            and user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="仅白板所有者或管理员可删除")
     await manager.delete_board(board_id)
     return {"ok": True, "deleted": board_id}
@@ -505,11 +506,15 @@ async def get_permissions(board_id: str, user: Dict[str, Any] = Depends(auth.cur
 async def put_permissions(board_id: str, req: PermissionsReq,
                           user: Dict[str, Any] = Depends(auth.current_user)):
     meta, role = await board_ctx(board_id, user, "owner")
+    # 用户名一律归一化为小写键存储, 与 auth.board_role 的查找口径一致;
+    # 输入大小写任意, 按不敏感匹配解析到已注册用户
+    known = {auth.norm_username(u["username"]) for u in auth.list_users()}
+    owner_key = auth.norm_username(meta.get("owner"))
     acl: Dict[str, str] = {}
-    known = {u["username"] for u in auth.list_users()}
     for name, want in (req.acl or {}).items():
-        if name in known and want in auth.VALID_ROLES and name != meta.get("owner"):
-            acl[name.lower()] = want
+        key = auth.norm_username(name)
+        if key and key in known and want in auth.VALID_ROLES and key != owner_key:
+            acl[key] = want
     meta["acl"] = acl
     if req.public_role in auth.VALID_ROLES:
         meta["public_role"] = req.public_role

@@ -35,6 +35,25 @@ VALID_ROLES = set(ROLE_ORDER.keys())
 _store_lock = threading.RLock()
 
 
+def norm_username(username: Optional[str]) -> str:
+    """用户名规范化: 去空白 + 小写。全系统比较/存取用户名统一走这里,
+    保证大小写不敏感(注册时仍保留用户输入的原始大小写用于展示)。"""
+    return (username or "").strip().lower()
+
+
+def _canonical_key(data: Dict[str, Any], username: str) -> Optional[str]:
+    """把(可能大小写不一致的)用户名解析为 users 表里的规范键;
+    优先精确命中, 否则按小写匹配。不存在返回 None。"""
+    users = data["users"]
+    if username in users:
+        return username
+    lowered = norm_username(username)
+    for key in users:
+        if norm_username(key) == lowered:
+            return key
+    return None
+
+
 # ---------------------------------------------------------------- 底层存取
 def _load_store() -> Dict[str, Any]:
     with _store_lock:
@@ -73,7 +92,7 @@ def register_user(username: str, password: str, display_name: Optional[str] = No
         raise ValueError("密码至少 4 位")
     with _store_lock:
         data = _load_store()
-        if username in data["users"]:
+        if _canonical_key(data, username) is not None:
             raise ValueError("用户名已存在")
         salt = secrets.token_bytes(16)
         user = {
@@ -108,7 +127,8 @@ def verify_login(username: str, password: str) -> Tuple[Dict[str, Any], str]:
     """校验口令, 返回 (public_user, token)。"""
     with _store_lock:
         data = _load_store()
-        user = data["users"].get((username or "").strip())
+        key = _canonical_key(data, (username or "").strip())
+        user = data["users"].get(key) if key else None
         if user is None:
             raise PermissionError("用户名或密码错误")
         if user.get("disabled"):
@@ -169,7 +189,8 @@ def list_users() -> List[Dict[str, Any]]:
 def update_user(username: str, patch: Dict[str, Any]) -> Dict[str, Any]:
     with _store_lock:
         data = _load_store()
-        user = data["users"].get(username)
+        key = _canonical_key(data, username)
+        user = data["users"].get(key) if key else None
         if user is None:
             raise KeyError(username)
         if patch.get("role") in ("admin", "user"):
@@ -190,7 +211,8 @@ def update_user(username: str, patch: Dict[str, Any]) -> Dict[str, Any]:
 
 def get_user(username: str) -> Optional[Dict[str, Any]]:
     data = _load_store()
-    user = data["users"].get(username)
+    key = _canonical_key(data, username)
+    user = data["users"].get(key) if key else None
     return public_user(user) if user else None
 
 
@@ -200,20 +222,28 @@ def count_users() -> int:
 
 # ---------------------------------------------------------------- 白板权限
 def board_role(user: Optional[Dict[str, Any]], meta: Dict[str, Any]) -> Optional[str]:
-    """计算用户在某白板上的有效角色; None=无权访问。"""
+    """计算用户在某白板上的有效角色; None=无权访问。
+
+    判定链(与前端 permissions 页预览一致, 全系统唯一口径):
+        系统管理员 → 白板所有者 → 成员授权(acl) → 邀请链接(public_role)
+    用户名比较一律大小写不敏感; acl 键读取时归一化, 兼容历史数据里
+    残留的混合大小写键。显式成员授权优先于公开链接角色, 设置
+    public_role 不会覆盖既有成员的权限。
+    """
     if user is None:
         return None
     if user.get("role") == "admin":
         return "owner"
-    if meta.get("owner") == user["username"]:
+    uname = norm_username(user.get("username"))
+    if norm_username(meta.get("owner")) == uname:
         return "owner"
+    acl = meta.get("acl") or {}
+    role = next((r for name, r in acl.items() if norm_username(name) == uname), None)
+    if role in VALID_ROLES:
+        return role
     public_role = meta.get("public_role")
     if public_role in VALID_ROLES:
         return public_role
-    acl = meta.get("acl") or {}
-    role = acl.get(user["username"])
-    if role in VALID_ROLES:
-        return role
     return None
 
 
