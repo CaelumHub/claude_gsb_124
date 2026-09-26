@@ -3,12 +3,17 @@
 - 口令: PBKDF2-HMAC-SHA256, 12 万轮, 每用户随机盐; 文件里只存盐+摘要。
 - 会话: 登录发 token(secrets.token_urlsafe), 存 users.json 的 sessions
   段, 滑动过期; REST 走 X-Auth-Token 头, WebSocket 走 ?token= 查询参数。
+- 用户名大小写不敏感: 一律以 canonical(去空格+小写)形式作为内部键,
+  注册/登录/ACL/owner 比较都走 canonical, 展示昵称用 display_name。
 - 全局角色: admin / user。
 - 白板级 ACL(存于各白板 meta.json):
       owner > editor > commenter > viewer
-  owner 记录在 meta.owner; 其他人在 meta.acl 里; public_role 决定
-  「持邀请链接的已登录用户」的默认角色。
-- 所有权限判断都在服务端(WS 操作接入与 REST 依赖注入)强制执行,
+  判定优先级(全系统唯一入口 board_role):
+      系统管理员 > 白板所有者(owner) > 成员授权(acl) > 邀请链接默认角色
+  owner 记录在 meta.owner; 其他人在 meta.acl 里; public_role 只对
+  「既不是 owner 也不在 acl 里的已登录用户」生效, 不会覆盖既有成员授权。
+- 能力判定统一走 can_view / can_comment / can_edit / can_manage;
+  所有权限判断都在服务端(WS 操作接入与 REST 依赖注入)强制执行,
   前端仅做展示层隐藏。
 """
 from __future__ import annotations
@@ -33,6 +38,26 @@ ROLE_ORDER = {"viewer": 1, "commenter": 2, "editor": 3, "owner": 4}
 VALID_ROLES = set(ROLE_ORDER.keys())
 
 _store_lock = threading.RLock()
+
+
+def canonical_username(name: Optional[str]) -> str:
+    """用户名内部键: 去首尾空格 + 小写。大小写不敏感的唯一归一化入口。"""
+    return (name or "").strip().lower()
+
+
+def normalize_acl(acl: Any) -> Dict[str, str]:
+    """把外部传入/磁盘上的 acl 归一成 {canonical_username: role}。
+
+    - 键一律 canonical(小写), 容忍历史上用混合大小写写入的条目;
+    - 非法角色/空键丢弃; owner 不应出现在 acl(由调用方另行剔除)。
+    """
+    out: Dict[str, str] = {}
+    if isinstance(acl, dict):
+        for name, role in acl.items():
+            key = canonical_username(name)
+            if key and role in VALID_ROLES:
+                out[key] = role
+    return out
 
 
 # ---------------------------------------------------------------- 底层存取
@@ -66,7 +91,7 @@ def _pick_color(index: int) -> str:
 
 # ---------------------------------------------------------------- 用户管理
 def register_user(username: str, password: str, display_name: Optional[str] = None) -> Dict[str, Any]:
-    username = (username or "").strip()
+    username = canonical_username(username)
     if not USERNAME_RE.match(username):
         raise ValueError("用户名需为 2-24 位中英文/数字/下划线")
     if len(password or "") < 4:
@@ -108,7 +133,7 @@ def verify_login(username: str, password: str) -> Tuple[Dict[str, Any], str]:
     """校验口令, 返回 (public_user, token)。"""
     with _store_lock:
         data = _load_store()
-        user = data["users"].get((username or "").strip())
+        user = data["users"].get(canonical_username(username))
         if user is None:
             raise PermissionError("用户名或密码错误")
         if user.get("disabled"):
@@ -169,7 +194,7 @@ def list_users() -> List[Dict[str, Any]]:
 def update_user(username: str, patch: Dict[str, Any]) -> Dict[str, Any]:
     with _store_lock:
         data = _load_store()
-        user = data["users"].get(username)
+        user = data["users"].get(canonical_username(username))
         if user is None:
             raise KeyError(username)
         if patch.get("role") in ("admin", "user"):
@@ -190,7 +215,7 @@ def update_user(username: str, patch: Dict[str, Any]) -> Dict[str, Any]:
 
 def get_user(username: str) -> Optional[Dict[str, Any]]:
     data = _load_store()
-    user = data["users"].get(username)
+    user = data["users"].get(canonical_username(username))
     return public_user(user) if user else None
 
 
@@ -198,22 +223,71 @@ def count_users() -> int:
     return len(_load_store()["users"])
 
 
+def migrate_store() -> int:
+    """启动时一次性归一化历史数据。
+
+    旧版本用户名按原样(可含大写)存储、ACL 也可能含混合大小写键;
+    这里把 users / sessions 的键统一成 canonical 形式。仅在发现
+    非 canonical 键时落盘。返回迁移的条目数(观测用)。
+    """
+    with _store_lock:
+        data = _load_store()
+        moved = 0
+        users: Dict[str, Any] = {}
+        for raw_name, user in data["users"].items():
+            key = canonical_username(raw_name)
+            if not key:
+                continue
+            if key in users:
+                # 极端情况: 历史上大小写不同的重复账号, 保留先出现的
+                continue
+            user["username"] = key
+            users[key] = user
+            if key != raw_name:
+                moved += 1
+        data["users"] = users
+
+        sessions: Dict[str, Any] = {}
+        for token, sess in data["sessions"].items():
+            user_key = canonical_username(sess.get("user"))
+            if user_key and user_key in users:
+                sess["user"] = user_key
+                sessions[token] = sess
+        data["sessions"] = sessions
+        if moved:
+            _save_store(data)
+        return moved
+
+
 # ---------------------------------------------------------------- 白板权限
 def board_role(user: Optional[Dict[str, Any]], meta: Dict[str, Any]) -> Optional[str]:
-    """计算用户在某白板上的有效角色; None=无权访问。"""
+    """计算用户在某白板上的有效角色; None=无权访问。
+
+    统一判定链(全系统唯一角色来源, REST/WS/前端预览均与此一致):
+        1. 系统管理员        → owner
+        2. 白板所有者        → owner
+        3. 成员授权 acl      → 该成员被授予的角色
+        4. 邀请链接默认角色  → public_role(仅当用户不在 acl 中时兜底)
+        5. 都不满足          → None(拒绝访问)
+
+    所有用户名比较都走 canonical_username, 大小写不敏感。
+    """
     if user is None:
+        return None
+    username = canonical_username(user.get("username"))
+    if not username:
         return None
     if user.get("role") == "admin":
         return "owner"
-    if meta.get("owner") == user["username"]:
+    if canonical_username(meta.get("owner")) == username:
         return "owner"
+    acl = normalize_acl(meta.get("acl"))
+    role = acl.get(username)
+    if role in VALID_ROLES:
+        return role
     public_role = meta.get("public_role")
     if public_role in VALID_ROLES:
         return public_role
-    acl = meta.get("acl") or {}
-    role = acl.get(user["username"])
-    if role in VALID_ROLES:
-        return role
     return None
 
 
@@ -221,6 +295,28 @@ def role_at_least(role: Optional[str], required: str) -> bool:
     if role is None:
         return False
     return ROLE_ORDER.get(role, 0) >= ROLE_ORDER.get(required, 99)
+
+
+# ---------------------------------------------------------------- 能力判定
+# 角色 → 能力的唯一映射, 前后端各页面与 WS 实时协作都以此为准:
+#   viewer    可见(查看白板/历史/导出/聊天记录)
+#   commenter viewer + 可在协作聊天发言
+#   editor    commenter + 可绘制编辑画布/撤销重做/存缩略图
+#   owner     editor + 可管理成员角色/公开角色/删除白板/压缩历史
+def can_view(role: Optional[str]) -> bool:
+    return role_at_least(role, "viewer")
+
+
+def can_comment(role: Optional[str]) -> bool:
+    return role_at_least(role, "commenter")
+
+
+def can_edit(role: Optional[str]) -> bool:
+    return role_at_least(role, "editor")
+
+
+def can_manage(role: Optional[str]) -> bool:
+    return role_at_least(role, "owner")
 
 
 # ---------------------------------------------------------------- FastAPI 依赖

@@ -94,10 +94,14 @@ async def get_chat(board_id: str,
 @router.post("/{board_id}/chat")
 async def post_chat(board_id: str, req: ChatPostReq,
                     user: Dict[str, Any] = Depends(auth.current_user)):
-    await board_ctx(board_id, user, "viewer")
+    _meta, role = await board_ctx(board_id, user, "viewer")
+    # 发言需要 commenter 及以上(与 WebSocket _handle_chat 同一规则)
+    if not auth.can_comment(role):
+        raise HTTPException(status_code=403, detail="当前角色无法发言(需要 commenter 及以上)")
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="消息不能为空")
-    message = await append_message(board_id, user, req.text.strip(), req.kind)
+    # 普通用户发言一律 kind=msg; system 仅服务端内部使用
+    message = await append_message(board_id, user, req.text.strip(), kind="msg")
     # REST 发送的消息也推给在线 WS 客户端
     from .ws import conn_manager
     await conn_manager.broadcast(board_id, {"type": "chat", "message": message},

@@ -195,6 +195,7 @@ import {
   confirmDialog, debounce, escapeHtml, fmtRel, getMe, initPage, loginDialog,
   modal, promptDialog, qs, toast, avatarHtml, colorOf,
 } from './js/ui.js';
+import { canEdit } from './js/roles.js';
 
 /* ---------------------------------------------------------------- 偏好 */
 function loadPrefs() {
@@ -274,6 +275,18 @@ const tools = new ToolManager({
 /* ---------------------------------------------------------------- 顶栏与状态 */
 let boardMeta = null;
 let myRole = 'viewer';
+
+/** 角色 → 画布只读态(editor 以下只读); 统一走 roles.js, 与服务端 can_edit 一致 */
+function applyRole(role, { silent = false } = {}) {
+  myRole = role || 'viewer';
+  $('st-role').textContent = `角色: ${myRole}`;
+  tools.readOnly = !canEdit(myRole);
+  if (!silent && tools.readOnly) {
+    toast(myRole === 'commenter'
+      ? '你是评论成员: 可查看与聊天, 不可编辑画布'
+      : '你是只读成员: 仅可查看', 'warn', 4200);
+  }
+}
 
 const $ = (id) => document.getElementById(id);
 
@@ -437,7 +450,7 @@ engine.opts.onZoomChange = null;
 tools.opts.onZoomChange = () => updateZoomLabel();
 
 $('board-name').onclick = async () => {
-  if (!['owner', 'editor'].includes(myRole)) return toast('无重命名权限', 'warn');
+  if (!canEdit(myRole)) return toast('无重命名权限', 'warn');
   const name = await promptDialog('白板名称', { value: boardMeta?.name || '' });
   if (!name) return;
   try {
@@ -549,14 +562,17 @@ socket.on('welcome', async (msg) => {
     toast(`已补发 ${msg.catchup.ops.length} 个离线期间的操作`, 'success');
   }
   renderUsers(msg.clients);
-  tools.readOnly = myRole === 'viewer' || myRole === 'commenter';
-  if (tools.readOnly) {
-    toast(myRole === 'commenter' ? '你是评论成员: 可查看与聊天, 不可编辑' : '你是只读成员: 仅可查看', 'warn', 4200);
-  }
+  applyRole(myRole);
   if (!engine._userMoved) { engine.fitToContent(); }
   engine.markDirty();
   updateStats();
   markAllPathsDirty();
+});
+
+/* 所有者在权限页调整后, 服务端推送新角色: 编辑/发言能力即时收敛/开放 */
+socket.on('role_changed', (msg) => {
+  applyRole(msg.role);
+  toast(`你的白板角色已更新为: ${msg.role}`, 'info', 3000);
 });
 
 socket.on('ops', (msg) => {
@@ -635,7 +651,7 @@ try {
   syncZCounter(shapes);
   engine.fitToContent();
   updateStats();
-  tools.readOnly = myRole === 'viewer' || myRole === 'commenter';
+  applyRole(myRole, { silent: true });
 } catch (err) {
   if (err.status === 403) {
     document.body.innerHTML = '<div class="empty-state" style="height:100vh"><div class="icon">🔒</div><div class="title">无权访问该白板</div><div>请向所有者申请权限, 或<a href="/permissions.html">查看权限页</a></div></div>';
@@ -651,7 +667,7 @@ socket.connect();
 
 /* ---------------------------------------------------------------- 缩略图 & 状态刷新 */
 const scheduleThumbnail = debounce(async () => {
-  if (!['owner', 'editor'].includes(myRole)) return;
+  if (!canEdit(myRole)) return;
   try {
     const canvas = document.createElement('canvas');
     const alive = [...shapes.values()].filter((s) => !s.deleted && s.kind !== 'ghost');
@@ -663,7 +679,7 @@ const scheduleThumbnail = debounce(async () => {
 
 window.addEventListener('beforeunload', () => {
   // 尽力而为: keepalive 让请求在页面卸载时仍能发出
-  if (!['owner', 'editor'].includes(myRole)) return;
+  if (!canEdit(myRole)) return;
   try {
     const canvas = document.createElement('canvas');
     const alive = [...shapes.values()].filter((s) => !s.deleted && s.kind !== 'ghost');

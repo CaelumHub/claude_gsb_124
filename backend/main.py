@@ -55,7 +55,7 @@ async def register(req: RegisterReq):
         user = auth.register_user(req.username, req.password, req.display_name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _user, token = auth.verify_login(req.username, req.password)
+    _user, token = auth.verify_login(user["username"], req.password)
     return {"user": user, "token": token}
 
 
@@ -93,7 +93,7 @@ async def list_users(user: Dict[str, Any] = Depends(auth.current_user)):
 @app.patch("/api/users/{username}")
 async def patch_user(username: str, req: UserPatchReq,
                      user: Dict[str, Any] = Depends(auth.current_user)):
-    is_self = user["username"] == username
+    is_self = user["username"] == auth.canonical_username(username)
     if not is_self and user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="只能修改自己的资料")
     patch = req.model_dump(exclude_none=True)
@@ -213,6 +213,7 @@ async def _background_tasks() -> None:
 async def on_startup() -> None:
     config.ensure_dirs()
     config.get_settings()
+    auth.migrate_store()          # 历史用户名/ACL 大小写归一化
     manager.load_index()
     from . import seed
     seed.seed_if_empty()

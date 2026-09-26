@@ -56,7 +56,7 @@ class Client:
     """一个 WS 连接(=一个浏览器标签页)。"""
 
     __slots__ = ("ws", "board_id", "client_id", "user", "role", "last_rev",
-                 "page", "queue", "sender_task", "connected_at", "last_seen",
+                 "page", "queue", "sender_task", "loop", "connected_at", "last_seen",
                  "cursor", "tool", "selection", "closed")
 
     def __init__(self, ws: WebSocket, board_id: str, client_id: str,
@@ -69,6 +69,9 @@ class Client:
         self.page = page
         self.last_rev = 0
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=CLIENT_QUEUE_LIMIT)
+        # 记录连接所在的事件循环: REST 请求(另一个线程/循环)里触发的断开/
+        # 角色推送必须用该循环调度, 否则任务会被错误循环取消导致连接异常关闭
+        self.loop = asyncio.get_running_loop()
         self.sender_task: Optional[asyncio.Task] = None
         self.connected_at = time.time()
         self.last_seen = time.time()
@@ -162,9 +165,25 @@ class ConnectionManager:
             if not client.offer(message):
                 dead.append(client)
         for client in dead:
-            asyncio.ensure_future(self.disconnect(client, reason="send-overflow"))
+            self.disconnect_soon(client, reason="send-overflow")
+
+    def disconnect_soon(self, client: Client, reason: str = "",
+                        code: Optional[int] = None) -> None:
+        """线程/循环安全的断开调度(REST 线程也可能调用)。"""
+        async def _run(c: Client = client, r: str = reason, cd: Optional[int] = code) -> None:
+            await self.disconnect(c, reason=r, code=cd)
+        loop = client.loop
+        try:
+            if loop.is_running():
+                loop.call_soon_threadsafe(lambda: loop.create_task(_run()))
+            else:
+                asyncio.run_coroutine_threadsafe(_run(), loop)
+        except RuntimeError:
+            # 循环已关闭等极端情况: 尽力在当前循环调度
+            asyncio.ensure_future(_run())
 
     async def send(self, client: Client, message: dict) -> None:
+        # offer 只是入队(线程安全); 出队发送始终在连接自己的 sender 协程里
         if not client.offer(message):
             await self.disconnect(client, reason="send-overflow")
 
@@ -172,7 +191,8 @@ class ConnectionManager:
         return {c.key: c.presence_dict() for c in room.clients.values()}
 
     # ------------------------------------------------------------ 断开
-    async def disconnect(self, client: Client, reason: str = "") -> None:
+    async def disconnect(self, client: Client, reason: str = "",
+                         code: Optional[int] = None) -> None:
         if client.closed:
             return
         client.closed = True
@@ -181,8 +201,10 @@ class ConnectionManager:
             room.clients.pop(client.key, None)
         if client.sender_task:
             client.sender_task.cancel()
+        if code is None:
+            code = 1011 if reason == "send-overflow" else 1000
         try:
-            await client.ws.close(code=1000 if reason != "send-overflow" else 1011)
+            await client.ws.close(code=code)
         except Exception:                                            # noqa: BLE001
             pass
         if room is not None:
@@ -194,6 +216,68 @@ class ConnectionManager:
                 "reason": reason,
             })
             await self._drop_room_if_empty(room)
+
+    # ------------------------------------------------------------ 角色热更新
+    async def refresh_board_roles(self, board_id: str) -> None:
+        """权限(acl/public_role/owner)变更后, 对房间内在线连接重算角色。
+
+        可从 WS 连接循环或 REST 请求线程调用: 真正的推送/断开统一调度到
+        房间内各连接自己的事件循环上执行, 避免跨循环调度误杀 sender 协程。
+
+        - 新角色 != 旧角色: 给本人推 role_changed, 给房间其他人广播其新角色;
+        - 已彻底失去访问权限: 推 forbidden 错误并断开(4403), 让客户端停止操作/发言。
+        保证实时协作里的编辑/发言权限与权限页保存结果立即一致。
+        """
+        room = self.rooms.get(board_id)
+        if room is None:
+            return
+        meta = manager.get_meta(board_id)
+        if meta is None:
+            return
+
+        # 收集各连接的判定结果(纯内存计算, 不触碰循环)
+        targets: List[Tuple[Client, Optional[str]]] = []
+        for client in list(room.clients.values()):
+            targets.append((client, auth.board_role(client.user, meta)))
+
+        async def _apply() -> None:
+            changed = 0
+            revoked: List[Client] = []
+            for client, new_role in targets:
+                old_role = client.role
+                if not auth.can_view(new_role):
+                    await self.send(client, {"type": "error", "code": "forbidden",
+                                             "message": "你的白板访问权限已被收回"})
+                    revoked.append(client)
+                    changed += 1
+                    continue
+                client.role = new_role or "viewer"
+                if new_role != old_role:
+                    await self.send(client, {"type": "role_changed", "role": client.role})
+                    changed += 1
+            if changed:
+                # 在线状态(含角色)统一刷一次, 让各页面成员列表与新角色一致
+                await self.broadcast(board_id, {
+                    "type": "presence",
+                    "clients": self.room_snapshot_clients(room),
+                })
+            # 等错误消息经 sender 协程真正发出后再断开, 避免客户端只看到连接关闭
+            if revoked:
+                await asyncio.sleep(0.15)
+                for client in revoked:
+                    await self.disconnect(client, reason="permission-revoked", code=4403)
+
+        # 调度到连接所在的循环并等待完成。REST 处理程序跑在另一个线程/循环上,
+        # 必须用 run_coroutine_threadsafe; 若调用方本身就在该循环里则直接 await,
+        # 否则会自己阻塞自己造成死锁。
+        current = asyncio.get_running_loop()
+        loops = {c.loop for c, _ in targets}
+        for loop in loops:
+            if loop is current:
+                await _apply()
+            else:
+                fut = asyncio.run_coroutine_threadsafe(_apply(), loop)
+                await asyncio.wrap_future(fut)
 
     # ------------------------------------------------------------ 主处理循环
     async def handle(self, ws: WebSocket, board_id: str,
@@ -213,7 +297,7 @@ class ConnectionManager:
             await ws.close(code=4404)
             return
         role = auth.board_role(user, meta)
-        if not auth.role_at_least(role, "viewer"):
+        if not auth.can_view(role):
             await ws.send_json({"type": "error", "code": "forbidden",
                                 "message": "无权访问该白板"})
             await ws.close(code=4403)
@@ -337,9 +421,20 @@ class ConnectionManager:
 
     # ------------------------------------------------------------ 操作接入
     async def _handle_ops(self, client: Client, room: Room, msg: Dict[str, Any]) -> None:
-        if not auth.role_at_least(client.role, "commenter"):
+        # 角色以最新 meta 为准(权限可能在连接期间被所有者调整)
+        meta = manager.get_meta(client.board_id)
+        if meta is not None:
+            new_role = auth.board_role(client.user, meta)
+            if new_role is None:
+                await self.send(client, {"type": "error", "code": "forbidden",
+                                         "message": "你的白板访问权限已被收回"})
+                await asyncio.sleep(0.15)   # 等错误消息发出后再断开
+                await self.disconnect(client, reason="permission-revoked", code=4403)
+                return
+            client.role = new_role
+        if not auth.can_edit(client.role):
             await self.send(client, {"type": "error", "code": "read_only",
-                                     "message": "当前角色无法编辑(需要 editor 及以上)"})
+                                     "message": "当前角色无法编辑画布(需要 editor 及以上)"})
             return
         raw_ops: List[Any] = msg.get("ops") if msg.get("type") == "ops" else [msg.get("op")]
         raw_ops = [o for o in (raw_ops or []) if o is not None]
@@ -372,14 +467,25 @@ class ConnectionManager:
 
     # ------------------------------------------------------------ 聊天
     async def _handle_chat(self, client: Client, msg: Dict[str, Any]) -> None:
-        if not auth.role_at_least(client.role, "commenter"):
+        # 角色以最新 meta 为准(权限可能在连接期间被所有者调整)
+        meta = manager.get_meta(client.board_id)
+        if meta is not None:
+            new_role = auth.board_role(client.user, meta)
+            if new_role is None:
+                await self.send(client, {"type": "error", "code": "forbidden",
+                                         "message": "你的白板访问权限已被收回"})
+                await asyncio.sleep(0.15)   # 等错误消息发出后再断开
+                await self.disconnect(client, reason="permission-revoked", code=4403)
+                return
+            client.role = new_role
+        if not auth.can_comment(client.role):
             await self.send(client, {"type": "error", "code": "no_chat",
-                                     "message": "当前角色无法发言"})
+                                     "message": "当前角色无法发言(需要 commenter 及以上)"})
             return
         text = str(msg.get("text") or "").strip()
         if not text:
             return
-        message = await chat_mod.append_message(client.board_id, client.user, text, kind="system")
+        message = await chat_mod.append_message(client.board_id, client.user, text, kind="msg")
         await self.broadcast(client.board_id, {"type": "chat", "message": message})
 
     # ------------------------------------------------------------ presence

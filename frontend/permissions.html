@@ -121,7 +121,7 @@
                 </tbody>
               </table>
               <div class="small muted" style="padding:10px 14px">
-                优先级: 系统管理员 &gt; 白板所有者 &gt; 成员授权(acl) &gt; 邀请链接默认角色。WebSocket 操作接入与全部 REST
+                优先级: 系统管理员 &gt; 白板所有者 &gt; 成员授权(acl) &gt; 邀请链接默认角色(仅对未单独授权的成员兜底, 不会覆盖成员角色)。用户名大小写不敏感(显示名仅用于展示)。WebSocket 操作接入与全部 REST
                 接口在服务端二次校验, 前端隐藏仅是展示层。
               </div>
             </div>
@@ -144,9 +144,10 @@
           <div class="panel">
             <div class="panel-head">👥 协作提示</div>
             <div class="panel-body small soft" style="line-height:1.8">
-              · 修改成员角色后, 对方页面在下一次操作/重连时生效<br>
+              · 修改成员角色并保存后, 在线成员的页面会立即收到 role_changed 并按新角色生效<br>
               · 「移除」= 从授权表删除, 若邀请链接开放则其仍可获得链接角色<br>
-              · 降级为 viewer 的在线用户会被拒绝后续编辑操作(read_only)<br>
+              · 编辑画布需 editor 及以上, 聊天发言需 commenter 及以上; viewer 两者均不可<br>
+              · 用户名大小写不敏感: 用 Alice / ALICE 授权与登录的是同一账号<br>
               · 实时在线列表见 <a href="/chat.html" id="chat-link">协作聊天</a> 页
             </div>
           </div>
@@ -184,11 +185,11 @@ import {
   avatarHtml, confirmDialog, escapeHtml, fmtTime, initPage, modal,
   promptDialog, qs, toast,
 } from './js/ui.js';
+import { ROLE_LABEL, canonicalUsername, effectiveRole } from './js/roles.js';
 
 const me = await initPage('permissions', { gate: true, title: '用户权限' });
 if (me) main(me);
 
-const ROLE_LABEL = { owner: '所有者', editor: '可编辑', commenter: '可评论', viewer: '只读' };
 const LS_BOARD = 'wb_perm_board';
 
 let boards = [];
@@ -265,9 +266,13 @@ async function loadPermissions(viaRefresh = false) {
     toast(err.message || '加载权限失败', 'error');
     return;
   }
-  pendingAcl = { ...(perm.acl || {}) };
+  pendingAcl = {};
+  for (const [name, role] of Object.entries(perm.acl || {})) {
+    pendingAcl[canonicalUsername(name)] = role;   // 键统一小写, 与服务端一致
+  }
   pendingPublic = perm.public_role || '';
-  if (!previewUsername || !perm.users.some((u) => u.username === previewUsername)) {
+  if (!previewUsername
+      || !perm.users.some((u) => canonicalUsername(u.username) === canonicalUsername(previewUsername))) {
     previewUsername = perm.users[0]?.username || null;
   }
   renderMatrix();
@@ -279,11 +284,14 @@ async function loadPermissions(viaRefresh = false) {
 
 function sourceOf(username) {
   if (!perm) return '—';
-  const u = perm.users.find((x) => x.username === username);
+  const key = canonicalUsername(username);
+  const acl = pendingAcl || {};
+  // 判定链与后端 auth.board_role 完全一致: admin > owner > acl > 公开角色
+  const u = perm.users.find((x) => canonicalUsername(x.username) === key);
   if (u?.role === 'admin') return '系统管理员(覆盖为 owner)';
-  if (perm.owner === username) return '白板所有者';
-  if ((perm.acl || {})[username]) return `成员授权 · ${ROLE_LABEL[perm.acl[username]]}`;
-  if (perm.public_role) return `邀请链接 · ${ROLE_LABEL[perm.public_role]}`;
+  if (canonicalUsername(perm.owner) === key) return '白板所有者';
+  if (acl[key]) return `成员授权 · ${ROLE_LABEL[acl[key]]}`;
+  if (pendingPublic) return `邀请链接 · ${ROLE_LABEL[pendingPublic]}(成员未单独授权时)`;
   return '未授权(无法访问)';
 }
 
@@ -297,8 +305,9 @@ function renderMatrix() {
     : '⚠ 仅白板所有者或系统管理员可修改成员权限, 当前为只读视图。';
 
   tbody.innerHTML = perm.users.map((u) => {
-    const isOwner = u.username === perm.owner;
-    const aclRole = pendingAcl[u.username] || '';
+    const ukey = canonicalUsername(u.username);
+    const isOwner = ukey === canonicalUsername(perm.owner);
+    const aclRole = pendingAcl[ukey] || '';
     const selectHtml = isOwner
       ? `<span class="badge accent">所有者</span>`
       : `<select class="select role-select sm" data-user="${escapeHtml(u.username)}" ${canManage ? '' : 'disabled'}>
@@ -308,7 +317,7 @@ function renderMatrix() {
           <option value="viewer" ${aclRole === 'viewer' ? 'selected' : ''}>只读 viewer</option>
         </select>`;
     return `
-    <tr class="row-clickable ${previewUsername === u.username ? 'row-selected' : ''}" data-user="${escapeHtml(u.username)}">
+    <tr class="row-clickable ${canonicalUsername(previewUsername) === canonicalUsername(u.username) ? 'row-selected' : ''}" data-user="${escapeHtml(u.username)}">
       <td>
         <div class="matrix-user">
           ${avatarHtml({ display_name: u.display_name, username: u.username, color: u.color })}
@@ -327,9 +336,9 @@ function renderMatrix() {
   tbody.querySelectorAll('select[data-user]').forEach((sel) => {
     sel.onclick = (e) => e.stopPropagation();
     sel.onchange = (e) => {
-      const username = sel.dataset.user;
-      if (e.target.value) pendingAcl[username] = e.target.value;
-      else delete pendingAcl[username];
+      const ukey = canonicalUsername(sel.dataset.user);
+      if (e.target.value) pendingAcl[ukey] = e.target.value;
+      else delete pendingAcl[ukey];
       updateSaveState();
       // 刷新该行的「来源」列与预览
       loadPermissionsSilently();
@@ -419,27 +428,32 @@ async function copyInvite() {
 }
 
 /* ------------------------------------------------------------ 有效性预览 */
-function effectiveRole(username) {
-  // 与 backend/auth.py board_role 同逻辑(以 pending 值预演保存后的效果)
-  const u = perm.users.find((x) => x.username === username);
-  const acl = pendingAcl;
-  if (u?.role === 'admin') return { role: 'owner', source: '系统管理员 → 覆盖为 owner', step: 1 };
-  if (perm.owner === username) return { role: 'owner', source: '白板所有者(meta.owner)', step: 2 };
-  if (acl[username]) return { role: acl[username], source: `成员授权表 acl → ${ROLE_LABEL[acl[username]]}`, step: 3 };
-  if (pendingPublic) return { role: pendingPublic, source: `邀请链接默认角色 → ${ROLE_LABEL[pendingPublic]}`, step: 4 };
-  return { role: null, source: '无任何授权 → 拒绝访问', step: 5 };
+function effectivePreview(username) {
+  // 以 pending 值预演保存后的效果; 判定逻辑直接复用 roles.js,
+  // 与 backend/auth.py board_role 保持同一来源
+  const u = perm.users.find((x) => canonicalUsername(x.username) === canonicalUsername(username));
+  const { role, step } = effectiveRole(u || {}, { owner: perm.owner, acl: pendingAcl,
+    public_role: pendingPublic || null }, username);
+  const source = {
+    1: '系统管理员 → 覆盖为 owner',
+    2: '白板所有者(meta.owner)',
+    3: `成员授权表 acl → ${ROLE_LABEL[role]}`,
+    4: `邀请链接默认角色 → ${ROLE_LABEL[role]}(仅兜底未单独授权的成员)`,
+    5: '无任何授权 → 拒绝访问',
+  }[step];
+  return { role, source, step };
 }
 
 function renderPreview() {
   const select = document.getElementById('preview-user');
   const options = perm.users.map((u) =>
-    `<option value="${escapeHtml(u.username)}" ${u.username === previewUsername ? 'selected' : ''}>${escapeHtml(u.display_name || u.username)}（@${escapeHtml(u.username)}）</option>`).join('');
+    `<option value="${escapeHtml(u.username)}" ${canonicalUsername(u.username) === canonicalUsername(previewUsername) ? 'selected' : ''}>${escapeHtml(u.display_name || u.username)}（@${escapeHtml(u.username)}）</option>`).join('');
   if (select.innerHTML !== options) select.innerHTML = options;
   const body = document.getElementById('preview-body');
   if (!previewUsername) { body.innerHTML = '<div class="small muted">暂无用户</div>'; return; }
-  const eff = effectiveRole(previewUsername);
+  const eff = effectivePreview(previewUsername);
   const steps = [
-    [1, '系统管理员?'], [2, '是所有者?'], [3, '在授权表(acl)?'], [4, '邀请链接开放?'], [5, '拒绝访问'],
+    [1, '系统管理员?'], [2, '是所有者?'], [3, '在授权表(acl)?'], [4, '邀请链接开放(仅兜底)?'], [5, '拒绝访问'],
   ];
   const badgeCls = { owner: 'accent', editor: 'green', commenter: 'yellow', viewer: '' }[eff.role] ?? 'red';
   body.innerHTML = `
@@ -452,7 +466,7 @@ function renderPreview() {
         </div>`).join('')}
     </div>
     <div class="divider"></div>
-    <div class="small muted">预览按当前未保存的编辑值实时推算, 与服务端 auth.board_role 判定链一致。</div>`;
+    <div class="small muted">预览按当前未保存的编辑值实时推算, 与服务端 auth.board_role 判定链一致; 公开角色只兜底不在 acl 中的成员, 不会覆盖成员授权。</div>`;
   void badgeCls;
 }
 

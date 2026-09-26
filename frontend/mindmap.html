@@ -144,6 +144,7 @@ import {
   avatarHtml, colorOf, escapeHtml, getMe, initPage, loginDialog, qs,
   toast, promptDialog,
 } from './js/ui.js';
+import { canEdit } from './js/roles.js';
 
 const me = await initPage('mindmap', { gate: true, title: '思维导图' });
 if (!me) throw new Error('未登录');
@@ -205,6 +206,21 @@ const $ = (id) => document.getElementById(id);
 let myRole = 'viewer';
 let boardMeta = null;
 
+/** 角色 → 导图只读态; 统一走 roles.js, 与服务端 can_edit 一致 */
+function applyRole(role, { silent = false } = {}) {
+  myRole = role || 'viewer';
+  $('st-role').textContent = `角色: ${myRole}`;
+  tools.readOnly = !canEdit(myRole);
+  $('btn-child').disabled = $('btn-sibling').disabled = $('btn-remove').disabled = tools.readOnly;
+  $('btn-layout').disabled = tools.readOnly;
+  if (!silent && tools.readOnly) {
+    toast(myRole === 'commenter'
+      ? '你是评论成员: 可查看与聊天, 不可编辑导图'
+      : '当前角色只读, 无法编辑导图', 'warn');
+  }
+  if (!tools.readOnly && !controller.rootNode()) controller.ensureRoot();
+}
+
 /* ---------------------------------------------------------------- 顶栏动作 */
 $('btn-sidebar').onclick = () => $('sidebar').classList.toggle('collapsed');
 $('btn-child').onclick = () => controller.addChild();
@@ -228,7 +244,7 @@ $('btn-zoom-out').onclick = () => engine.zoomAt(0.8, engine.width / 2, engine.he
 $('btn-zoom-fit').onclick = () => { engine.fitToContent(120); updateMinimap(); };
 
 $('board-name').onclick = async () => {
-  if (!['owner', 'editor'].includes(myRole)) return;
+  if (!canEdit(myRole)) return;
   const name = await promptDialog('白板名称', { value: boardMeta?.name || '' });
   if (!name) return;
   try {
@@ -318,16 +334,16 @@ socket.on('welcome', (msg) => {
     toast(`已补发 ${msg.catchup.ops.length} 个离线期间的操作`, 'success');
   }
   renderUsers(msg.clients);
-  tools.readOnly = myRole === 'viewer' || myRole === 'commenter';
-  if (tools.readOnly) {
-    $('btn-child').disabled = $('btn-sibling').disabled = $('btn-remove').disabled = true;
-    $('btn-layout').disabled = true;
-    toast('当前角色只读, 无法编辑导图', 'warn');
-  }
-  if (!controller.rootNode() && !tools.readOnly) controller.ensureRoot();
+  applyRole(myRole);
   controller.renderOutline();
   engine.fitToContent(120);
   afterChange();
+});
+
+/* 所有者在权限页调整后, 服务端推送新角色: 编辑能力即时收敛/开放 */
+socket.on('role_changed', (msg) => {
+  applyRole(msg.role);
+  toast(`你的白板角色已更新为: ${msg.role}`, 'info', 3000);
 });
 
 socket.on('ops', (msg) => {
@@ -374,8 +390,7 @@ try {
   socket.lastRev = data.rev || 0;
   engine.rebuildIndex();
   syncZCounter(shapes);
-  tools.readOnly = myRole === 'viewer' || myRole === 'commenter';
-  if (!controller.rootNode() && !tools.readOnly) controller.ensureRoot();
+  applyRole(myRole, { silent: true });
   controller.renderOutline();
   engine.fitToContent(120);
   updateStatus();

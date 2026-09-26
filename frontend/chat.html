@@ -124,6 +124,7 @@ import { BoardSocket } from './js/ws.js';
 import {
   avatarHtml, escapeHtml, fmtTime, getMe, initPage, qs, toast,
 } from './js/ui.js';
+import { canComment } from './js/roles.js';
 
 const me = await initPage('chat', { gate: true, title: '协作聊天' });
 
@@ -343,9 +344,11 @@ async function main() {
       $hint.textContent = '未连接房间';
       return;
     }
-    if (myRole === 'viewer') {
+    if (!canComment(myRole)) {
       $input.disabled = true; $send.disabled = true;
-      $hint.textContent = '🔒 您在该房间是只读成员, 不能发言(可请所有者在「用户权限」页调整角色)';
+      $hint.textContent = myRole === 'viewer'
+        ? '🔒 您在该房间是只读成员, 不能发言(可请所有者在「用户权限」页调整角色)'
+        : '🔒 当前角色不能发言(需要 commenter 及以上)';
       return;
     }
     $input.disabled = false; $send.disabled = false;
@@ -401,6 +404,12 @@ async function main() {
       }
       renderMembers();
       updateInputState();
+    });
+    /* 角色在权限页被调整后即时生效: commenter 被降级则输入框立即锁定 */
+    socket.on('role_changed', (msg) => {
+      myRole = msg.role || '';
+      updateInputState();
+      toast(`你的白板角色已更新为: ${myRole}`, 'info', 3000);
     });
     socket.on('chat', ({ message }) => appendMessage(message));
     socket.on('join', (m) => {

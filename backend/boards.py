@@ -74,15 +74,44 @@ class BoardManager:
             entries = os.listdir(config.BOARDS_DIR)
         except FileNotFoundError:
             entries = []
+        dirty_metas: List[str] = []
         for name in entries:
             path = os.path.join(config.BOARDS_DIR, name)
             if not os.path.isdir(path) or name.startswith("_") or name.startswith("."):
                 continue
             meta = read_json(os.path.join(path, "meta.json"), default=None)
             if isinstance(meta, dict) and meta.get("id"):
+                if self._normalize_meta(meta):
+                    dirty_metas.append(meta["id"])
                 self.metas[meta["id"]] = meta
                 boards[meta["id"]] = self._index_entry(meta)
         self._write_index(boards)
+        for bid in dirty_metas:
+            meta = self.metas.get(bid)
+            if meta is not None:
+                # 同步落盘归一化后的 owner/acl, 避免旧大小写键长期残留
+                write_json_atomic(self._meta_path(bid), meta)
+
+    @staticmethod
+    def _normalize_meta(meta: Dict[str, Any]) -> bool:
+        """把 meta 内 owner/acl 的用户名归一化为 canonical; 有变更返回 True。"""
+        dirty = False
+        owner_raw = meta.get("owner")
+        owner_key = auth.canonical_username(owner_raw)
+        if owner_key and owner_key != owner_raw:
+            meta["owner"] = owner_key
+            dirty = True
+        acl_raw = meta.get("acl")
+        acl = auth.normalize_acl(acl_raw)
+        # owner 不应残留在 acl 里
+        if owner_key:
+            acl.pop(owner_key, None)
+        if acl_raw != acl:
+            meta["acl"] = acl
+            dirty = True
+        if not isinstance(meta.get("acl"), dict):
+            meta["acl"] = acl
+        return dirty
 
     @staticmethod
     def _index_entry(meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -104,6 +133,7 @@ class BoardManager:
             # 索引可能落后于磁盘(手工拷贝目录等), 兜底再读一次
             disk = read_json(self._meta_path(board_id), default=None)
             if isinstance(disk, dict) and disk.get("id"):
+                self._normalize_meta(disk)
                 self.metas[board_id] = disk
                 meta = disk
         return meta
@@ -379,7 +409,7 @@ async def board_ctx(board_id: str, user: Dict[str, Any],
     if meta is None:
         raise HTTPException(status_code=404, detail="白板不存在")
     role = auth.board_role(user, meta)
-    if not auth.role_at_least(role, "viewer"):
+    if not auth.can_view(role):
         raise HTTPException(status_code=403, detail="无权访问该白板")
     if not auth.role_at_least(role, required):
         raise HTTPException(status_code=403,
@@ -395,7 +425,7 @@ async def list_boards(q: str = "", mode: str = "", tag: str = "",
     out: List[Dict[str, Any]] = []
     for bid, meta in manager.metas.items():
         role = auth.board_role(user, meta)
-        if not auth.role_at_least(role, "viewer"):
+        if not auth.can_view(role):
             continue
         if q and q.lower() not in (meta.get("name") or "").lower():
             continue
@@ -451,7 +481,8 @@ async def delete_board(board_id: str, user: Dict[str, Any] = Depends(auth.curren
     meta = manager.get_meta(board_id)
     if meta is None:
         raise HTTPException(status_code=404, detail="白板不存在")
-    if meta.get("owner") != user["username"] and user.get("role") != "admin":
+    if auth.canonical_username(meta.get("owner")) != auth.canonical_username(user["username"]) \
+            and user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="仅白板所有者或管理员可删除")
     await manager.delete_board(board_id)
     return {"ok": True, "deleted": board_id}
@@ -497,7 +528,7 @@ async def get_permissions(board_id: str, user: Dict[str, Any] = Depends(auth.cur
         "your_role": role,
         "users": [{"username": u["username"], "display_name": u["display_name"],
                    "color": u["color"], "role": u["role"]} for u in users],
-        "can_manage": role == "owner",
+        "can_manage": auth.can_manage(role),
     }
 
 
@@ -505,17 +536,23 @@ async def get_permissions(board_id: str, user: Dict[str, Any] = Depends(auth.cur
 async def put_permissions(board_id: str, req: PermissionsReq,
                           user: Dict[str, Any] = Depends(auth.current_user)):
     meta, role = await board_ctx(board_id, user, "owner")
+    owner_key = auth.canonical_username(meta.get("owner"))
+    known = {auth.canonical_username(u["username"]) for u in auth.list_users()}
+    # 成员授权: 键统一 canonical(大小写不敏感), 非法用户/角色丢弃, owner 不进 acl
     acl: Dict[str, str] = {}
-    known = {u["username"] for u in auth.list_users()}
     for name, want in (req.acl or {}).items():
-        if name in known and want in auth.VALID_ROLES and name != meta.get("owner"):
-            acl[name.lower()] = want
+        key = auth.canonical_username(name)
+        if key in known and want in auth.VALID_ROLES and key != owner_key:
+            acl[key] = want
     meta["acl"] = acl
     if req.public_role in auth.VALID_ROLES:
         meta["public_role"] = req.public_role
     elif req.public_role is not None:
         meta["public_role"] = None
     await manager.save_meta(board_id)
+    # 权限对在线连接即时生效: 重算房间内每个客户端的角色并推送变更
+    from .ws import conn_manager
+    await conn_manager.refresh_board_roles(board_id)
     return {"ok": True, "acl": meta["acl"], "public_role": meta.get("public_role")}
 
 
